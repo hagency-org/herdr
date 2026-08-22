@@ -1,0 +1,40 @@
+id = "octoscode"
+version = "2026.08.23.1"
+min_engine_version = 1
+updated_at = "2026-08-23T00:00:00Z"
+aliases = ["octos-tui"]
+
+[[rules]]
+id = "approval_blocked"
+state = "blocked"
+priority = 1100
+region = "whole_recent"
+visible_blocker = true
+any = [
+  { contains = ["Approval | y once | s session | n deny"] },
+  { contains = ["Waiting on you"] },
+  { contains = ["Ctrl+R/Alt+A answer"] },
+  { contains = ["审批 | y 本次 | s 本会话"] },
+]
+
+[[rules]]
+id = "statusbar_working"
+state = "working"
+priority = 1000
+region = "bottom_non_empty_lines(6)"
+visible_working = true
+any = [
+  { line_regex = ['state\s*[·,]\s*Working'] },
+  { contains = ["Esc interrupt"] },
+]
+
+[[rules]]
+id = "statusbar_idle"
+state = "idle"
+priority = 900
+region = "bottom_non_empty_lines(6)"
+any = [
+  { line_regex = ['state\s*[·✓,⚠]*\s*(Idle|Done)'] },
+  { contains = ["Tab agents | Ctrl+O expand"] },
+  { contains = ["Ask Octos to change code"] },
+]

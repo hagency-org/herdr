@@ -78,6 +78,12 @@ def catalogue():
         ("paste-escape-looking", "literal [200~ and \\x1b[31m\nend"),
     ]:
         cases.append(dict(id=name, kind="paste", text=text, expected={mode: {"paste": text} for mode in MODES[1:]}))
+    cases.append(dict(id="clipboard-image", kind="clipboard-image",
+                      expected={mode: {"clipboard_image": True,
+                                       "sha256": "4BA8D4FD5AB42544FEEFF22D50E84412502433CC95952FD1DF9A5293588DDBEA"}
+                                for mode in MODES[1:]}))
+    cases.append(dict(id="clipboard-mixed", kind="clipboard-mixed", text="clipboard text wins",
+                      expected={mode: {"paste": "clipboard text wins"} for mode in MODES[1:]}))
     cases.append(dict(id="mouse-interleave", kind="mouse-interleave", text="mouse\npaste",
                       expected={mode: {"mouse_interleave": True} for mode in MODES[1:]}))
     cases.append(dict(id="mouse-focus-refresh", kind="mouse-focus-refresh",
@@ -115,10 +121,42 @@ def catalogue():
         ("ctrl-shift-end", "Qualify Ctrl+Shift+End with the Windows Terminal scroll binding explicitly controlled."),
         ("paste-supplementary", "Qualify supplementary-plane clipboard text, including emoji, against the direct-host baseline."),
         ("paste-burst", "Qualify a 200-line clipboard burst with the host multiline-paste warning configured or handled explicitly."),
-        ("clipboard-nontext", "Qualify supported image/file clipboard integrations separately; do not infer from text paste."),
     ]:
         cases.append(dict(id=name, kind="qualification", prompt=prompt, expected={}))
-    return dict(schema=1, widths=WIDTHS, heights=HEIGHTS, modes=MODES, cases=cases)
+    legacy = ["letter-a", "shift-letter", "up", "down", "left", "right", "home", "end", "insert", "delete",
+              "tab", "shift-tab", "paste-lf", "paste-crlf", "paste-cr", "paste-whitespace", "paste-unicode",
+              "paste-escape-looking", "mouse-interleave", "mouse-focus-refresh", "mode-transitions"]
+    mok2 = ["letter-a", "shift-enter", "ctrl-enter", "ctrl-shift-enter", "paste-lf", "dead-acute"]
+    release_plan = [dict(channel="stable", path="herdr", mode="legacy", cases=legacy),
+                    dict(channel="stable", path="herdr", mode="mok2", cases=mok2),
+                    dict(channel="preview", path="herdr", mode="kitty", cases=sorted(set(legacy + mok2)))]
+    return dict(schema=1, widths=WIDTHS, heights=HEIGHTS, modes=MODES, cases=cases, release_plan=release_plan)
+
+
+def classification_of_client_events(trace_lines):
+    """Classify how a paste reached the pane from the mapper's client-event trace.
+
+    The pane capture alone cannot tell a paste the terminal issued from a
+    reaction to a consumed key or an empty bracketed paste (#4314). The mapper
+    trace records the decoded client events, so the batch that carried the
+    paste identifies its origin. Returns one of:
+    "terminal-paste", "empty-paste", "key-event", "none", or None when the
+    trace is unavailable. Only "terminal-paste" and "empty-paste" are positive
+    evidence; callers must not treat the others as bridge proof.
+    """
+    if trace_lines is None:
+        return None
+    for line in trace_lines:
+        if not isinstance(line, str):
+            return None
+        if 'Paste { text: ""' in line:
+            return "empty-paste"
+        if "Paste {" in line:
+            return "terminal-paste"
+    for line in trace_lines:
+        if isinstance(line, str) and 'Key {' in line and "kind: Press" in line:
+            return "key-event"
+    return "none"
 
 
 def verdict(case, mode, evidence):
@@ -132,6 +170,8 @@ def verdict(case, mode, evidence):
         return "inconclusive", "Missing readiness, focus, or complete capture"
     if evidence.get("error"):
         return "inconclusive", evidence["error"]
+    if case["kind"] == "clipboard-image" and evidence.get("path") == "herdr":
+        return "not_run", "Clipboard image bridging is active only for remote clients"
     if evidence.get("path") == "herdr" and case["id"] in ("page-up", "page-down") and "vk" not in expected:
         expected = {"hex": [""]}  # Plain page keys intentionally control Herdr's host scrollback.
     def geometry(name):
@@ -204,6 +244,36 @@ def verdict(case, mode, evidence):
         raw = bytes.fromhex(evidence["hex"])
     except (KeyError, ValueError, TypeError):
         return "inconclusive", "Missing or malformed raw bytes"
+    if expected.get("clipboard_image"):
+        origin = evidence.get("paste_origin")
+        if evidence.get("path") == "direct":
+            if raw != b"\x1b[200~\x1b[201~":
+                return "fail", "Terminal did not emit an empty bracketed paste for image-only clipboard"
+            if origin not in (None, "empty-paste"):
+                return "fail", f"Direct empty paste was decoded as {origin}, not an empty paste"
+            return "pass", "Terminal emitted an empty bracketed paste for image-only clipboard"
+        if evidence.get("path") != "herdr-remote":
+            return "not_run", "Clipboard image bridge requires the remote-client gauntlet path"
+        if not raw.startswith(b"\x1b[200~") or not raw.endswith(b"\x1b[201~"):
+            return "fail", "Remote clipboard image did not reach the pane as one paste"
+        try:
+            path = raw[6:-6].decode("utf-8")
+        except UnicodeDecodeError:
+            return "fail", "Staged clipboard image path is not UTF-8"
+        valid_path = re.fullmatch(r"[A-Za-z]:\\.*\\herdr-clipboard-images-[^\\]+\\[^\\]+\.png", path)
+        if not valid_path:
+            return "fail", "Pane did not receive a staged clipboard PNG path"
+        # A staged image must come from the bridge reacting to an empty paste, not
+        # from a paste the terminal issued for text on the clipboard (#4314).
+        if origin == "terminal-paste":
+            return "fail", "Terminal issued the paste; the remote image bridge did not react to the empty paste"
+        if origin != "empty-paste":
+            # Without the mapper trace there is no evidence the bridge reacted to
+            # an empty paste; a staged path alone cannot qualify the bridge.
+            return "inconclusive", "Missing client trace evidence of an empty-paste bridge reaction"
+        return (("pass", "Exact clipboard PNG was staged and its path reached the pane")
+                if evidence.get("staged_image_sha256") == expected["sha256"] else
+                ("fail", "Staged clipboard image contents differ from the fixture"))
     if expected.get("mouse_interleave"):
         motion = rb"(?:\x1b\[<35;\d+;\d+M)+"
         newline = rb"(?:\r\n|\r|\n)"
@@ -276,6 +346,9 @@ def summarize(document):
             raise ValueError(f"Duplicate observation identity: {identity}")
         seen.add(identity)
         case = cases[observation["case"]]
+        paste_origin = classification_of_client_events(observation.get("client_events"))
+        if paste_origin is not None:
+            observation = {**observation, "paste_origin": paste_origin}
         status, reason = verdict(case, observation["mode"], observation)
         scope = "direct_host" if observation.get("path") == "direct" else "through_herdr_not_yet_attributed"
         if status in ("pass", "fail"):
@@ -296,13 +369,14 @@ def summarize(document):
     # No run may claim all-green just because it produced zero/missing observations.
     planned = set()
     geometries = [(120, 30, True)] + [(w, h, False) for h in document.get("heights", HEIGHTS) for w in document.get("widths", WIDTHS)] + [(80, 30, False)]
-    selected_cases = document.get("cases") or list(cases)
-    for host in document.get("channels") or ("stable", "preview"):
-        for path in document.get("paths") or ("direct", "herdr"):
-            for mode in document.get("modes", MODES):
-                for phase, (width, height, full) in enumerate(geometries, 1):
-                    for case_id in selected_cases if full else (case_id for case_id in ("letter-a", "shift-enter", "paste-lf", "mouse-focus-refresh") if case_id in selected_cases):
-                        planned.add((host, path, mode, phase, width, height, case_id))
+    run_specs = document.get("run_specs") or [dict(channel=host, path=path, mode=mode, cases=document.get("cases") or list(cases))
+                                               for host in document.get("channels") or ("stable", "preview")
+                                               for path in document.get("paths") or ("direct", "herdr")
+                                               for mode in document.get("modes", MODES)]
+    for spec in run_specs:
+        for phase, (width, height, full) in enumerate(geometries, 1):
+            for case_id in spec["cases"] if full else (case_id for case_id in ("letter-a", "shift-enter", "paste-lf", "mouse-focus-refresh") if case_id in spec["cases"]):
+                planned.add((spec["channel"], spec["path"], spec["mode"], phase, width, height, case_id))
     missing = planned - seen
     if seen - planned:
         raise ValueError("Observations outside the declared run matrix")
@@ -312,7 +386,9 @@ def summarize(document):
     complete = (bool(rows) and not missing and {h.get("channel") for h in hosts} == expected_hosts
                 and all(h.get("runs") for h in hosts)
                 and not errors and not document.get("cleanup_errors")
-                and all(r["status"] == "pass" for r in rows))
+                and all(r["status"] == "pass" for r in rows)
+                and (document.get("campaign") != "release" or
+                     herdr_protocol_proven({"hosts": hosts, "observations": rows}, {"stable"})))
     return {**document, "errors": errors, "observations": rows, "counts": counts, "coverage_missing": len(missing), "observed_checks_passed": complete,
             "native_qualification": "Required; this report is not a full Windows support certificate"}
 
@@ -320,6 +396,7 @@ def summarize(document):
 def qualification_matrix(result):
     """Collapse real observations into the user-facing capability summary."""
     rows = result.get("observations", [])
+    release = result.get("campaign") == "release"
     required_channels = set(result.get("channels") or ("stable", "preview"))
     manual_cases = {case["id"] for case in catalogue()["cases"] if case["kind"] == "manual"}
     groups = [
@@ -332,6 +409,7 @@ def qualification_matrix(result):
         ("CR/LF/CRLF paste", {"paste-lf", "paste-crlf", "paste-cr"}, None),
         ("Unicode/whitespace paste", {"paste-unicode", "paste-whitespace"}, None),
         ("Paste framing/ordering", {case["id"] for case in catalogue()["cases"] if case["kind"] == "paste"}, None),
+        ("Remote clipboard image", {"clipboard-image", "clipboard-mixed"}, None),
         ("Resize 120 -> 80", {"letter-a", "shift-enter", "paste-lf"}, 80),
         ("Mouse while typing/pasting", {"mouse-interleave"}, None),
         ("Mouse after focus regain", {"mouse-focus-refresh"}, None),
@@ -342,28 +420,59 @@ def qualification_matrix(result):
         ("Runtime mode transitions", {"mode-transitions"}, None),
     ]
 
-    def cell(case_ids, width, path, modes):
+    if release:
+        groups = [(name, case_ids - {"page-up", "page-down"} if name == "Navigation/editing" else case_ids,
+                   None if name == "Resize 120 -> 80" else width)
+                  for name, case_ids, width in groups if name != "Remote clipboard image"]
+        groups.insert(5, ("PageUp/PageDown scroll", set(), None))
+    release_specs = (result.get("run_specs") or catalogue()["release_plan"]) if release else []
+
+    def cell(case_ids, width, path, modes, channels=required_channels, required_widths=None, failure_modes=None):
         matched = [row for row in rows if row.get("case") in case_ids and row.get("path") == path
-                   and row.get("mode") in modes and (width is None or row.get("width") == width)]
+                   and row.get("mode") in modes and row.get("host") in channels
+                   and (width is None or row.get("width") == width)]
         statuses = {row.get("status") for row in matched}
+        if failure_modes:
+            selected_rows = [row for row in rows if row.get("case") in case_ids and row.get("path") == path
+                             and row.get("mode") in failure_modes and row.get("host") in channels
+                             and (width is None or row.get("width") == width)]
+            statuses.update(row.get("status") for row in selected_rows if row.get("status") != "pass")
         if "fail" in statuses:
             return "FAIL"
         if case_ids <= manual_cases and not any(status == "pass" for status in statuses):
             return "MANUAL"
+        if release and statuses - {"pass"}:
+            return "INCONCLUSIVE" if "inconclusive" in statuses else "UNSUPPORTED" if "unsupported" in statuses else "PARTIAL" if "pass" in statuses else "NOT TESTED"
         if {row.get("case") for row in matched} != case_ids:
             return "PARTIAL" if "pass" in statuses else "INCONCLUSIVE" if "inconclusive" in statuses else "NOT TESTED"
-        if required_channels and {(row.get("host"), row.get("case")) for row in matched} != {
-                (channel, case_id) for channel in required_channels for case_id in case_ids}:
+        expected_pairs = {(channel, case_id) for channel in channels for case_id in case_ids}
+        if channels and {(row.get("host"), row.get("case")) for row in matched} != expected_pairs:
+            return "PARTIAL"
+        if failure_modes:
+            selected_pairs = {(spec["mode"], case_id) for spec in release_specs if spec["channel"] in channels
+                              and spec["path"] == path and spec["mode"] in failure_modes for case_id in case_ids
+                              if case_id in spec["cases"]}
+            if selected_pairs - {(row.get("mode"), row.get("case")) for row in selected_rows}:
+                return "PARTIAL"
+        if required_widths and not {
+                (channel, case_id, required_width) for channel in channels for case_id in case_ids
+                for required_width in required_widths} <= {
+                (row.get("host"), row.get("case"), row.get("width")) for row in matched}:
             return "PARTIAL"
         if case_ids == {"mode-transitions"} and path == "direct" and statuses <= {"unsupported", "inconclusive"}:
             return "X - mOK ignored"
-        if path == "direct" and modes == {"legacy"} and statuses == {"unsupported"}:
+        if path == "direct" and modes == {"legacy"} and statuses - {"not_run"} == {"unsupported"}:
+            if {(row.get("host"), row.get("case")) for row in matched if row.get("status") == "unsupported"} != expected_pairs:
+                return "PARTIAL"
             return "X - becomes Enter" if case_ids == {"shift-enter"} else "X - loses modifier"
-        def case_passed(case_id):
-            statuses_for_case = {row.get("status") for row in matched if row.get("case") == case_id}
+        def case_passed(case_id, channel=None):
+            statuses_for_case = {row.get("status") for row in matched if row.get("case") == case_id
+                                 and (channel is None or row.get("host") == channel)}
             return "pass" in statuses_for_case or (width == 80 and path == "direct" and modes == {"legacy"}
-                                                     and case_id == "shift-enter" and statuses_for_case == {"unsupported"})
+                                                     and case_id == "shift-enter" and statuses_for_case - {"not_run"} == {"unsupported"})
         per_case_passed = all(case_passed(case_id) for case_id in case_ids)
+        if "not_run" in statuses and all(case_passed(case_id, channel) for channel in channels for case_id in case_ids):
+            return "PARTIAL"
         allowed = {"pass", "inconclusive"}
         if width == 80 and path == "direct" and modes == {"legacy"}:
             allowed.add("unsupported")
@@ -377,26 +486,42 @@ def qualification_matrix(result):
 
     table = []
     for name, case_ids, width in groups:
+        if release and name == "PageUp/PageDown scroll":
+            table.append((name, "MANUAL", "MANUAL"))
+            continue
         herdr_modes = {"legacy"} if name in {"Mouse after resize", "Runtime mode transitions"} else {"mok2"} if "Enter" in name or name in {"Resize 120 -> 80", "Dead-key composition", "AltGr", "IME composition"} else {"legacy"}
-        table.append((name, cell(case_ids, width, "herdr", herdr_modes),
-                      cell(case_ids, width, "direct", {"legacy"}), cell(case_ids, width, "direct", {"kitty"})))
+        herdr_path = "herdr-remote" if name == "Remote clipboard image" else "herdr"
+        if release:
+            required_widths = {120, 80} if name == "Resize 120 -> 80" else None
+            table.append((name, cell(case_ids, width, "herdr", herdr_modes, {"stable"}, required_widths, {"legacy", "mok2"}),
+                          cell(case_ids, width, "herdr", {"kitty"}, {"preview"}, required_widths)))
+        else:
+            table.append((name, cell(case_ids, width, herdr_path, herdr_modes),
+                          cell(case_ids, width, "direct", {"legacy"}), cell(case_ids, width, "direct", {"kitty"})))
     return table
 
 
-def herdr_protocol_label(result):
+def herdr_protocol_proven(result, channels=None):
     runs = {(host.get("channel"), run.get("path"), run.get("mode"), run.get("nonce"))
             for host in result.get("hosts", []) for run in host.get("runs", [])
-            if run.get("path") == "herdr" and run.get("nonce")}
+            if run.get("path") in {"herdr", "herdr-remote"} and run.get("nonce")
+            and (channels is None or host.get("channel") in channels)}
     proven = {(row.get("host"), row.get("path"), row.get("mode"), row.get("nonce"))
               for row in result.get("observations", [])
-              if row.get("path") == "herdr" and row.get("input_reader") == "windows-console"
+              if row.get("path") in {"herdr", "herdr-remote"} and row.get("input_reader") == "windows-console"
               and row.get("input_transport") == "win32-serialized" and row.get("nonce")}
-    return "Win32 (Herdr)*" if runs and runs <= proven else "Herdr default (UNKNOWN)*"
+    return bool(runs) and runs <= proven
+
+
+def herdr_protocol_label(result, channels=None):
+    return "Win32 (Herdr)*" if herdr_protocol_proven(result, channels) else "Herdr default (UNKNOWN)*"
 
 
 def print_qualification_matrix(result):
-    table = [("Thing", herdr_protocol_label(result), "Plain VT", "Kitty"), *qualification_matrix(result)]
-    widths = [max(len(str(row[column])) for row in table) for column in range(4)]
+    table = ([("Thing", "Stable WT / " + herdr_protocol_label(result, {"stable"}), "Preview WT / Kitty")]
+             if result.get("campaign") == "release" else
+             [("Thing", herdr_protocol_label(result), "Plain VT", "Kitty")]) + qualification_matrix(result)
+    widths = [max(len(str(row[column])) for row in table) for column in range(len(table[0]))]
     line = lambda row: " | ".join(str(value).ljust(widths[index]) for index, value in enumerate(row))
     print("\nWindows input qualification results")
     print(line(table[0]))
@@ -404,8 +529,11 @@ def print_qualification_matrix(result):
     for row in table[1:]:
         print(line(row))
     print("* Herdr protocol label comes from runtime evidence; UNKNOWN is never treated as Win32.")
-    print("** At least one capable host passed; host capability gaps remain visible in report.json.")
-    print("MANUAL requires an operator-assisted -Manual run; no automated result is claimed.")
+    if result.get("campaign") == "release":
+        print("MANUAL: physically verify PageUp/PageDown scrolling, AltGr, and IME before release.")
+    else:
+        print("** At least one capable host passed; host capability gaps remain visible in report.json.")
+        print("MANUAL requires an operator-assisted -Manual run; no automated result is claimed.")
 
 
 def main():
@@ -418,7 +546,7 @@ def main():
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if args.command == "report":
         counts = result["counts"]
-        through_failures = sum(row["status"] == "fail" and row.get("path") == "herdr" for row in result["observations"])
+        through_failures = sum(row["status"] == "fail" and row.get("path") != "direct" for row in result["observations"])
         direct_failures = sum(row["status"] == "fail" and row.get("path") == "direct" for row in result["observations"])
         print(f"Observed: {counts['pass']} pass, {counts['fail']} fail, {counts['unsupported']} unsupported, "
               f"{counts['inconclusive']} inconclusive, {counts['not_run']} not run; "
@@ -427,6 +555,8 @@ def main():
             print(f"Assessment: {through_failures} through-Herdr failures need attribution; inspect report.json before treating them as product regressions")
         elif result.get("errors") or result.get("cleanup_errors"):
             print("Assessment: harness or cleanup failed; this run does not qualify input behavior")
+        elif result.get("campaign") == "release" and not herdr_protocol_proven(result, {"stable"}):
+            print("Assessment: Stable Win32 runtime evidence missing; the release matrix is incomplete")
         elif direct_failures:
             print(f"Assessment: {direct_failures} direct-host differences observed; these are not automatically Herdr bugs")
         elif counts["inconclusive"] or counts["not_run"] or counts["unsupported"] or result["coverage_missing"]:
@@ -437,6 +567,9 @@ def main():
             print("Run errors: " + " | ".join(result["errors"]))
         if result.get("cleanup_errors"):
             print("Cleanup errors: " + " | ".join(result["cleanup_errors"]))
+        failures = [row for row in result["observations"] if row["status"] == "fail"]
+        for row in failures:
+            print(f"FAIL: {row['host']}/{row['path']}/{row['mode']} {row['case']} at {row['width']}x{row['height']}: {row['reason']}")
         print_qualification_matrix(result)
         return 1 if result["counts"]["fail"] or result.get("errors") or result.get("cleanup_errors") else 2 if not result["observed_checks_passed"] else 0
     return 0
